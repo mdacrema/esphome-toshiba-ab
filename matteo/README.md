@@ -21,6 +21,11 @@ Notes from testing:
   the unit raises check code 30, stops the indoor fan and the compressor for that zone.
   The local firmware falls back to TA (−2 °C in heat, like FC 06) and reports right after
   registration.
+- The unit answers every header `61 38` with a status frame. Reports colliding with the unit's
+  own 5 s keepalive, or simply not answered (seen on one unit, ~1 in 3), can add up to 3 min
+  without an accepted report → check code 30 for a few seconds. The local firmware does not
+  transmit from 4.5 s after the unit's keepalive until the next one, and repeats an unanswered
+  report after 3 s (up to 5 times).
 
 The YAML files need a `secrets.yaml` next to them (`wifi_ssid`, `wifi_password`,
 `fallback_hotspot_password`).

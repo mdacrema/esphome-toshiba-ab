@@ -321,6 +321,13 @@ bool ToshibaAbClimate::in_tu2c_header_window_(uint32_t now) const {
     if (since <= 95000UL && (phase >= 28500UL || phase < 1000UL))
       return true;
   }
+  // The unit's own keepalive, every ~5 s (4.9-5.3 s): nothing from 4.5 s after the last one until
+  // it arrives (2026-10-31: our report collided with it for 3 min on studi -> check code 30).
+  if (this->tu2c_unit_keepalive_ms_ != 0) {
+    const uint32_t since = now - this->tu2c_unit_keepalive_ms_;
+    if (since >= 4500UL && since < 6000UL)
+      return true;
+  }
   // F3 keepalive query, every 60 s (added 2026-10-31: code 32 on 10-30 with the report protected).
   if (this->tu2c_header_ka_ms_ != 0) {
     const uint32_t since = now - this->tu2c_header_ka_ms_;
@@ -516,9 +523,7 @@ void log_raw_data(const std::string& prefix, const uint8_t raw[], size_t size) {
     std::snprintf(buf, sizeof(buf), "%02X", raw[i]);
     res += buf;
   }
-  // LOCAL (temporary, 2026-10-28): DEBUG instead of VERBOSE to capture every frame around
-  // check code 32 without recompiling the whole firmware at VERBOSE.
-  ESP_LOGD("RX", "%s: %s", prefix.c_str(), res.c_str());
+  ESP_LOGV("RX", "%s: %s", prefix.c_str(), res.c_str());
 }
 
 std::string frame_to_hex_string(const DataFrame *frame) {
@@ -834,6 +839,26 @@ void ToshibaAbClimate::send_ext_temp_now_() {
   } else {
     ESP_LOGV(TAG, "report_sensor_temp: source has no valid state");
   }
+}
+
+// LOCAL: the unit answers each 61 38 report with a status frame. As the header, repeat an
+// unanswered report after 3 s (up to 5 times), so 3 min without an accepted report (check code 30)
+// cannot build up (2026-10-31: notte 15:14, reports on the wire but not answered).
+void ToshibaAbClimate::check_tu2c_report_answered_() {
+  if (this->tu2c_report_sent_ms_ == 0 || millis() - this->tu2c_report_sent_ms_ < 1500UL)
+    return;
+  this->tu2c_report_sent_ms_ = 0;
+  this->tu2c_report_missed_++;
+  if (!this->is_tu2c_header_() || this->tu2c_report_retries_ >= 5) {
+    ESP_LOGW(TAG, "TU2C: room temperature report not answered by the unit (missed=%u)",
+             (unsigned) this->tu2c_report_missed_);
+    this->tu2c_report_retries_ = 0;
+    return;
+  }
+  this->tu2c_report_retries_++;
+  ESP_LOGW(TAG, "TU2C: room temperature report not answered, retry %u in 3 s (missed=%u)",
+           (unsigned) this->tu2c_report_retries_, (unsigned) this->tu2c_report_missed_);
+  this->set_timeout("tu2c_report_retry", 3000, [this]() { this->send_ext_temp_now_(); });
 }
 
 // LOCAL: this board is the header wired remote (0x50) on a TU2C bus.
@@ -2330,6 +2355,7 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
   if (frame_length == 0x0A && has_tail_signature) {
     log_raw_data("Master keepalive", frame->raw, size);
     ESP_LOGD(TAG, "Master %02X keepalive", source);
+    this->tu2c_unit_keepalive_ms_ = millis() | 1;  // LOCAL
     this->record_discovered_address_(source, false);
     last_master_alive_millis_ = millis();
     if (this->connected_binary_sensor_) {
@@ -2453,6 +2479,10 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
     this->check_tu2c_status_anomaly_(frame, is_extended_status_frame);  // LOCAL
     this->publish_tu2c_raw_status_(frame, is_extended_status_frame);    // LOCAL
     this->refresh_tu2c_alarm_(is_extended_status_frame && size > 15 && frame->raw[14] == 0xFF);  // LOCAL
+    if (this->tu2c_report_sent_ms_ != 0) {  // LOCAL: our room temperature report was answered
+      this->tu2c_report_sent_ms_ = 0;
+      this->tu2c_report_retries_ = 0;
+    }
     tcc_state.power = (payload[STATUS_DATA_MODEPOWER_BYTE] & STATUS_DATA_POWER_MASK);
     tcc_state.mode = decode_status_mode(payload[STATUS_DATA_MODEPOWER_BYTE]);
     tcc_state.fan = (payload[STATUS_DATA_FANVENT_BYTE] & STATUS_DATA_FAN_MASK) >> STATUS_DATA_FAN_SHIFT_BITS;
@@ -3152,6 +3182,7 @@ void ToshibaAbClimate::publish_reader_diagnostics_() {
 
 void ToshibaAbClimate::loop() {
   if (millis() - this->last_diagnostics_publish_ms_ >= 30000) this->publish_reader_diagnostics_();
+  this->check_tu2c_report_answered_();  // LOCAL
   // TODO: check if last_unconfirmed_command_ was not confirmed after a timeout
   // and log warning/error
 
@@ -3263,6 +3294,8 @@ void ToshibaAbClimate::loop() {
       if (frame.is_tu2c()) {
         log_tu2c_data_frame("Write frame", &frame);
         this->record_bus_frame_(frame.raw, frame.size(), 1);  // LOCAL
+        if (frame.raw[1] == this->tu2c_remote_address_ && frame.raw[4] == 0x61 && frame.raw[5] == 0x38)
+          this->tu2c_report_sent_ms_ = millis() | 1;  // LOCAL: see check_tu2c_report_answered_()
       } else {
         log_data_frame("Write frame", &frame);
       }
@@ -4844,6 +4877,12 @@ void ToshibaAbClimate::handle_tu2c_check_code_(uint8_t code, const DataFrame *fr
 
 // LOCAL: ring buffer of the last BUS_CAPTURE_SIZE TU2C frames (see set_bus_capture_sensor()).
 void ToshibaAbClimate::record_bus_frame_(const uint8_t *raw, size_t len, uint8_t dir) {
+  // Monitor-function queries (41 5C, except the F3 keepalive) and their 80 5C replies are left
+  // out, so the buffer covers more than the 3 min that lead to check code 30.
+  if (len >= 8 && raw[4] == 0x41 && raw[5] == 0x5C && raw[7] != 0xF3)
+    return;
+  if (len >= 6 && raw[4] == 0x80 && raw[5] == 0x5C)
+    return;
   BusCaptureEntry &e = this->bus_capture_[this->bus_capture_next_];
   e.ms = millis();
   e.dir = dir;

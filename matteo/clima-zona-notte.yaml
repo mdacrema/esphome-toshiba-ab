@@ -32,6 +32,7 @@ logger:
   level: DEBUG
 
 api:
+  reboot_timeout: 5min   # 2026-10-31: studi network stack hung 16 min (default 15 min)
 
 ota:
   - platform: esphome
@@ -360,6 +361,15 @@ sensor:
           }
   # Control temperature the indoor unit is regulating on (TU2C status frame): our
   # reference value when it is accepted, otherwise the return-air sensor TA.
+  # LOCAL (2026-10-31): our room temperature reports not answered by the unit, since boot
+  - platform: template
+    name: "Temperature non confermate dal clima"
+    icon: mdi:thermometer-alert
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return id(clima)->get_tu2c_report_missed();
   - platform: template
     id: clima_control_temp
     name: "Temperatura usata dal clima"

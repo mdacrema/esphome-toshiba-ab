@@ -1148,6 +1148,9 @@ class ToshibaAbClimate : public Component, public uart::UARTDevice, public clima
   // time to a text sensor when a check code appears, so HA history keeps the capture.
   void set_bus_capture_sensor(text_sensor::TextSensor *sensor) { bus_capture_sensor_ = sensor; }
   void dump_bus_capture() { start_bus_capture_dump_(millis()); }
+  // LOCAL (not in the PR): our 61 38 room temperature reports the unit did not answer with a
+  // status frame (counted since boot).
+  uint32_t get_tu2c_report_missed() const { return tu2c_report_missed_; }
   // LOCAL (not in the PR): preheat flag of the TU2C status (PRE-HEAT on the wired remote).
   void set_preheat_sensor(binary_sensor::BinarySensor *sensor) { preheat_sensor_ = sensor; }
   // LOCAL (not in the PR): register this board with the indoor unit again (49 0D).
@@ -1360,7 +1363,7 @@ class ToshibaAbClimate : public Component, public uart::UARTDevice, public clima
     uint8_t len;
     uint8_t raw[24];
   };
-  static constexpr uint8_t BUS_CAPTURE_SIZE = 64;                // LOCAL
+  static constexpr uint8_t BUS_CAPTURE_SIZE = 96;                // LOCAL
   std::array<BusCaptureEntry, BUS_CAPTURE_SIZE> bus_capture_{};  // LOCAL
   uint8_t bus_capture_next_{0};              // LOCAL
   uint8_t bus_capture_count_{0};             // LOCAL
@@ -1377,6 +1380,11 @@ class ToshibaAbClimate : public Component, public uart::UARTDevice, public clima
   float tu2c_header_fallback_temp_();        // LOCAL
   uint32_t tu2c_fallback_logged_ms_{0};      // LOCAL
   uint32_t tu2c_last_report_ms_{0};          // LOCAL: millis() of our last 61 38 room temperature
+  uint32_t tu2c_unit_keepalive_ms_{0};       // LOCAL: millis() of the unit's last 5 s keepalive
+  uint32_t tu2c_report_sent_ms_{0};          // LOCAL: our 61 38 waiting for the unit's status reply
+  uint8_t tu2c_report_retries_{0};           // LOCAL
+  uint32_t tu2c_report_missed_{0};           // LOCAL
+  void check_tu2c_report_answered_();        // LOCAL
   bool in_tu2c_header_window_(uint32_t now) const;  // LOCAL
   void send_ext_temp_now_();                 // LOCAL
   void send_tu2c_monitor_query_(uint8_t code);
