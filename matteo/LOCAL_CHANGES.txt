@@ -1,0 +1,12 @@
+makusets/esphome-toshiba-ab d0de6e5 + PR branch tu2c-room-temp-follower (pr/esphome-toshiba-ab, b199486)
++ LOCAL: get_tu2c_control_temp() for the "Temperatura usata dal clima" sensor (marked // LOCAL)
++ LOCAL: anomaly trap (report_tu2c_anomaly_ / check_tu2c_status_anomaly_, marked // LOCAL).
+  2026-10-19: 0x55 accepted next to 0x33 (heat mode); each anomaly published once per 24 h, max 1/min.
++ LOCAL: raw status text sensors (set_raw_status_text_sensors / publish_tu2c_raw_status_), 2026-10-27.
++ LOCAL: check code decoding (C0/A0 29 <unit> <code> 59, ext. status byte 14 = FF while active), 2026-10-27; trap key = full payload for undecoded frames.
+- 2026-10-28 (temporary): log_raw_data at DEBUG and TU2C bad-checksum frame dump, to capture check code 32 (notte, studi).
+- 2026-10-28 (test, giorno only): number 'Ritardo invio temperatura dopo comando' (room temp report N s after the wall remote's 61 38, 0 = 30 s timer, fallback after 45 s silence) and button 'Registra di nuovo la scheda sul clima' (49 0D).
+- 2026-10-29: room temp report 15 s after the wall remote's (number initial 15, range 0–29.8) and switch 'Pausa invii intorno al comando' (no TX from −1.5 s to +1 s around the remote's 30 s report): check code 32 = collision with the wall remote's report.
+- 2026-10-31: pause window also around the wall remote's F3 keepalive (60 s); in-memory bus capture (64 frames) published to text sensor 'Cattura bus prima del codice' 5 s after the first check code of an episode, button 'Invia cattura bus ora'.
+- 2026-10-31: TU2C header mode (studi 0x50, wall remote Follower, FC 32 = 0001): room temp never stops (fallback TA−2 in heat / TA / setpoint), first report right after registration; binary_sensor 'Preriscaldamento'; capture dump waits 1 s after 'inizio cattura'.
+- 2026-10-31: anomaly trap ignores unit replies to remotes (80 xx), unit internal frames (90->90) and settings-menu broadcasts (00 61/00 62/x0 64).

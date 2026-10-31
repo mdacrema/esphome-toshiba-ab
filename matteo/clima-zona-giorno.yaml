@@ -1,0 +1,429 @@
+# Toshiba multi-split indoor unit (RAS-M..U2DVG-E, wired remote RB-RWS21-E)
+# Board: makusets/esphome-toshiba-ab v3.2 (ESP-12F), protocol TU2C.
+#
+# First flash over USB: power jumper on USB, hold BOOT while plugging the cable in.
+# Connect A/B only with the whole HVAC system switched off at the breaker, then
+# move the jumper to AB. Keep read_only until the logs show valid TU2C frames.
+
+substitutions:
+  name: clima-zona-giorno
+  friendly_name: Clima Zona Giorno
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      # LOCAL: raw TU2C status frames to HA (see text_sensor below)
+      - lambda: id(clima)->set_raw_status_text_sensors(id(clima_stato_grezzo), id(clima_stato_esteso_grezzo));
+      # LOCAL: check code broadcast by the unit (see binary_sensor / text_sensor below)
+      - lambda: id(clima)->set_check_code_sensors(id(clima_codice_controllo), id(clima_allarme_attivo));
+      - lambda: id(clima)->set_bus_capture_sensor(id(clima_cattura_bus));
+      - lambda: id(clima)->set_preheat_sensor(id(clima_preriscaldamento));
+      # LOCAL: room temperature report a fixed delay after the wall remote's (0 = 30 s timer)
+      - lambda: id(clima)->set_tu2c_temp_sync_delay(id(ritardo_invio_temperatura).state);
+
+esp8266:
+  board: esp12e
+
+logger:
+  baud_rate: 0   # the hardware UART pins are used for the AB bus
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 10dB   # recommended by the project: less noise on the AB line
+  ap:
+    ssid: "${name} Fallback"
+    password: !secret fallback_hotspot_password
+
+captive_portal:
+
+external_components:
+  # makusets/esphome-toshiba-ab d0de6e5 + our PR branch + local control-temp getter (see UPSTREAM_COMMIT.txt)
+  # + TU2C monitor-function queries (codes of the wired remote's "Monitor function" menu).
+  - source:
+      type: local
+      path: ../components
+    components: [toshiba_ab]
+
+uart:
+  tx_pin: GPIO12   # v3.2 board
+  rx_pin: GPIO13
+  baud_rate: 2400
+  parity: NONE     # TU2C
+  rx_buffer_size: 2048
+
+climate:
+  - platform: toshiba_ab
+    name: "Climatizzatore"
+    id: clima
+    frame_format: tu2c
+    # Talk as a second (follower) wired remote: the wall remote keeps 0x50 as header.
+    # With both on 0x50 the remote shows check code 30/32 as soon as the board sends
+    # the room temperature (2026-10-15).
+    remote: 0x50           # HEADER since 2026-10-31: the wall remote is set as Follower (0x51), FC 32 = 0001
+    fan_levels: 5          # wired remote shows 1-5 bars: adds Low-Medium / Medium-High
+    filter_reset:
+      name: "Reset filtro"
+    read_only: false         # commands verified on the soggiorno unit 2026-10-15 (power, mode, fan levels); switch in HA can re-enable listen-only
+    read_only_switch:
+      name: "Sola lettura"
+    connected:
+      name: "Collegamento climatizzatore"
+    filter_alert:
+      name: "Allarme filtro"
+    # Room temperature for the unit: Zigbee sensor next to the wall remote, sent every 30 s
+    # in the wired remote's TU2C frame (61 38 01 <raw>), as the Header (FC 32 = 0001 since 2026-10-31).
+    report_sensor_temp:
+      enabled: true
+      sensor: temp_studio_zigbee
+      interval: 30s
+    # TU2C monitor-function codes (wired remote: MENU + down 4 s > 4. Monitor function).
+    # Not served by this unit: 00/01 (computed by the remote itself), 70 (compressor
+    # frequency) and most other codes. F0-F2 meaning/scale still to be confirmed.
+    sensors:
+      - address: 0x02
+        interval: 60s
+        sensor:
+          name: "Temp. aria aspirata (TA)"
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          entity_category: diagnostic
+      - address: 0x03
+        interval: 60s
+        sensor:
+          name: "Temp. batteria interna (TCJ)"
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          entity_category: diagnostic
+      - address: 0x04
+        interval: 60s
+        sensor:
+          name: "Temp. batteria interna (TC)"
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          entity_category: diagnostic
+      - address: 0x07
+        interval: 60s
+        sensor:
+          name: "Giri ventola interna"
+          unit_of_measurement: "rpm"
+          entity_category: diagnostic
+      - address: 0x08
+        interval: 5min
+        sensor:
+          name: "Monitor codice 08"
+          entity_category: diagnostic
+      - address: 0x60
+        interval: 60s
+        sensor:
+          name: "Temp. batteria esterna (TE)"
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          entity_category: diagnostic
+      - address: 0x61
+        interval: 60s
+        sensor:
+          name: "Temp. esterna (TO)"
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          entity_category: diagnostic
+      - address: 0x62
+        interval: 60s
+        sensor:
+          name: "Temp. mandata compressore (TD)"
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          entity_category: diagnostic
+      - address: 0x63
+        interval: 60s
+        sensor:
+          name: "Temp. aspirazione compressore (TS)"
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          entity_category: diagnostic
+      - address: 0x6A
+        interval: 60s
+        scale: 0.1   # 0.1 A: 56 raw = 5.6 A vs 1386 W on the "clima" meter (only this unit running)
+        sensor:
+          name: "Corrente unità esterna"
+          unit_of_measurement: "A"
+          device_class: current
+          state_class: measurement
+          accuracy_decimals: 1
+      - address: 0xF0
+        interval: 1h
+        sensor:
+          name: "Monitor codice F0"
+          entity_category: diagnostic
+      - address: 0xF1
+        interval: 1h
+        sensor:
+          name: "Monitor codice F1 (ore compressore x100?)"
+          entity_category: diagnostic
+      - address: 0xF2
+        interval: 1h
+        sensor:
+          name: "Monitor codice F2 (ore ventola x100?)"
+          entity_category: diagnostic
+      - address: 0xF3
+        interval: 1h
+        sensor:
+          name: "Ore filtro"
+          unit_of_measurement: "h"
+          entity_category: diagnostic
+
+globals:
+  - id: zigbee_last_valid
+    type: float
+    initial_value: "NAN"
+  - id: zigbee_unavailable_since   # millis() when the HA entity became unavailable, 0 = available
+    type: uint32_t
+    initial_value: "0"
+  - id: ha_disconnected_since      # millis() when Home Assistant disconnected, 0 = connected
+    type: uint32_t
+    initial_value: "0"
+
+binary_sensor:
+  # LOCAL (2026-10-31): PRE-HEAT shown on the wired remote (indoor coil not warm yet)
+  - platform: template
+    id: clima_preriscaldamento
+    name: "Preriscaldamento"
+    icon: mdi:radiator
+  # LOCAL: on while the unit reports a check code (C0 29 <unit> <code> 59 on the bus)
+  - platform: template
+    id: clima_allarme_attivo
+    name: "Allarme clima attivo"
+    device_class: problem
+  - platform: template
+    name: "Sensore temperatura studio non disponibile"
+    device_class: problem
+    lambda: return id(zigbee_unavailable_since) != 0;
+  - platform: template
+    name: "Clima su sonda interna (sensore scaduto)"
+    device_class: problem
+    lambda: |-
+      return id(zigbee_unavailable_since) != 0 &&
+             millis() - id(zigbee_unavailable_since) >= 30UL * 60UL * 1000UL;
+
+interval:
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            api.connected:
+              state_subscription_only: true
+          then:
+            - lambda: id(ha_disconnected_since) = 0;
+          else:
+            - lambda: |-
+                if (id(ha_disconnected_since) == 0) {
+                  id(ha_disconnected_since) = millis() | 1;
+                  ESP_LOGW("zigbee_temp", "Home Assistant disconnected: holding the last room temperature for 30 min");
+                }
+
+number:
+  # LOCAL (2026-10-28/29, check code 32): seconds between the wall remote's room temperature
+  # report and ours; 0 = free-running 30 s timer (collided with the remote's report on 10-29).
+  - platform: template
+    id: ritardo_invio_temperatura
+    name: "Ritardo invio temperatura dopo comando"
+    icon: mdi:timer-sync-outline
+    entity_category: config
+    unit_of_measurement: s
+    min_value: 0
+    max_value: 29.8
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: false   # always starts on the 30 s timer
+    initial_value: 15     # mid-way between two wall remote reports (2026-10-29)
+    set_action:
+      - lambda: id(clima)->set_tu2c_temp_sync_delay(x);
+
+text:
+  # LOCAL (2026-10-31, debug): queue a raw frame on the bus, e.g. "F0:F0:0D:50:90:C0:41:1A:F1:2F:00:28:A0"
+  - platform: template
+    name: "Invia frame grezzo"
+    icon: mdi:console-line
+    entity_category: config
+    mode: text
+    optimistic: true
+    max_length: 80
+    set_action:
+      - lambda: id(clima)->send_raw_frame_from_text(x);
+
+button:
+  # LOCAL (2026-10-31): ask the unit for FC 32 as the wired remote's FC menu does: "41 1A F1 <fc>"
+  # returns the NEXT function code, so F1 2F -> reply 80 1A 32 <value> ("ACK from master" in the log).
+  - platform: template
+    name: "Leggi FC 32 dall'unità"
+    icon: mdi:numeric
+    entity_category: diagnostic
+    on_press:
+      - toshiba_ab.send_raw_frame:
+          id: clima
+          frame: "F0:F0:0D:50:90:C0:41:1A:F1:2F:00:28:A0"
+  # LOCAL (2026-10-31): publish the bus capture now (test)
+  - platform: template
+    name: "Invia cattura bus ora"
+    icon: mdi:upload-outline
+    entity_category: diagnostic
+    on_press:
+      - lambda: id(clima)->dump_bus_capture();
+  # LOCAL (test 2026-10-28): register the board with the indoor unit again, as at boot.
+  - platform: template
+    name: "Registra di nuovo la scheda sul clima"
+    icon: mdi:link-variant-plus
+    entity_category: config
+    on_press:
+      - lambda: id(clima)->request_tu2c_registration();
+
+switch:
+  # LOCAL (2026-10-29, check code 32): no frames from 1.5 s before to 1 s after the wall
+  # remote's room temperature report. Not restored: always on after a reboot.
+  - platform: template
+    name: "Pausa invii intorno al comando"
+    icon: mdi:timer-pause-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_ON
+    turn_on_action:
+      - lambda: id(clima)->set_tu2c_header_window(true);
+    turn_off_action:
+      - lambda: id(clima)->set_tu2c_header_window(false);
+
+  # LOCAL anomaly trap: publishes undecoded frames from the unit and unusual status
+  # bytes to "Messaggio anomalo dal clima" (one notification per different message).
+  - platform: template
+    name: "Trappola messaggi anomali"
+    id: anomaly_trap
+    icon: mdi:bug-check-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          id(clima)->set_anomaly_text_sensor(id(clima_anomalia));
+          id(clima)->set_anomaly_trap(true);
+    turn_off_action:
+      - lambda: id(clima)->set_anomaly_trap(false);
+
+  - platform: template
+    name: "Invia temperatura Zigbee al clima"
+    id: send_zigbee_temp
+    icon: mdi:thermometer-auto
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON    # FC 32 = 0000 on all three remotes; ON if the saved state is lost (2026-10-28)
+    turn_on_action:
+      - lambda: id(clima)->set_ext_temp_enabled(true);
+    turn_off_action:
+      - lambda: id(clima)->set_ext_temp_enabled(false);
+
+sensor:
+  # Zigbee room sensor from Home Assistant. An unchanged value is not re-sent by HA: the
+  # last value is kept and re-sent to the unit every 30 s. Only "unavailable" (NAN) counts
+  # as a failure: the last good value is held for 30 minutes, then reporting stops and the
+  # unit falls back to its own return-air sensor.
+  - platform: homeassistant
+    id: temp_studio_ha
+    entity_id: sensor.clima_zona_giorno_temperatura_riferimento   # reference sensor chosen in HA (input_select)
+    internal: true
+    on_value:
+      - lambda: |-
+          if (std::isnan(x)) {
+            if (id(zigbee_unavailable_since) == 0) {
+              id(zigbee_unavailable_since) = millis() | 1;  // never 0 while unavailable
+              ESP_LOGW("zigbee_temp", "Room sensor unavailable: holding %.1f°C for 30 min", id(zigbee_last_valid));
+            }
+          } else {
+            if (id(zigbee_unavailable_since) != 0)
+              ESP_LOGI("zigbee_temp", "Room sensor available again: %.1f°C", x);
+            id(zigbee_last_valid) = x;
+            id(zigbee_unavailable_since) = 0;
+            id(temp_studio_zigbee).update();  // publish now (first value after boot: header report)
+          }
+  # Control temperature the indoor unit is regulating on (TU2C status frame): our
+  # reference value when it is accepted, otherwise the return-air sensor TA.
+  - platform: template
+    id: clima_control_temp
+    name: "Temperatura usata dal clima"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: return id(clima)->get_tu2c_control_temp();
+  - platform: template
+    id: temp_studio_zigbee
+    name: "Temperatura inviata al clima"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 30s
+    # Published already rounded to 0.5 °C, the resolution of the TU2C frame
+    # (raw = (°C + 35) * 2, rounded to nearest): this is exactly what the unit receives.
+    lambda: |-
+      // Home Assistant down for 30 minutes: the last value may be stale, stop reporting.
+      if (id(ha_disconnected_since) != 0 &&
+          millis() - id(ha_disconnected_since) >= 30UL * 60UL * 1000UL)
+        return NAN;
+      float t = NAN;
+      if (id(zigbee_unavailable_since) == 0)
+        t = id(zigbee_last_valid);
+      else if (millis() - id(zigbee_unavailable_since) < 30UL * 60UL * 1000UL)
+        t = id(zigbee_last_valid);      // hold the last good value for 30 minutes
+      // else NAN: stop reporting, the unit uses its own sensor
+      return std::isnan(t) ? NAN : std::round(t * 2.0f) / 2.0f;
+  - platform: wifi_signal
+    name: "Segnale WiFi"
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+
+text_sensor:
+  # LOCAL (2026-10-31): last 64 TU2C frames, published one line every 150 ms when a check code
+  # appears ("<s from the code> RX|TX|BAD <hex>"); HA history keeps every line.
+  - platform: template
+    id: clima_cattura_bus
+    name: "Cattura bus prima del codice"
+    icon: mdi:record-rec
+    entity_category: diagnostic
+  - platform: template
+    id: clima_anomalia
+    name: "Messaggio anomalo dal clima"
+    icon: mdi:alert-decagram-outline
+    entity_category: diagnostic
+  # LOCAL: raw TU2C status frames (hex), published only when they change, so HA keeps
+  # their history and the undecoded bytes can be matched to unit events later.
+  - platform: template
+    id: clima_stato_grezzo
+    name: "Stato clima (grezzo)"
+    icon: mdi:code-brackets
+    entity_category: diagnostic
+  - platform: template
+    id: clima_stato_esteso_grezzo
+    name: "Stato esteso clima (grezzo)"
+    icon: mdi:code-brackets
+    entity_category: diagnostic
+  # LOCAL: active check code as shown by the wired remote (e.g. "32"), "nessuno" when clear
+  - platform: template
+    id: clima_codice_controllo
+    name: "Codice di controllo clima"
+    icon: mdi:alert-circle-outline

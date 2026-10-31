@@ -310,6 +310,27 @@ bool ToshibaAbClimate::has_bus_quiet_time_elapsed_(uint32_t now) const {
          (now - this->last_sent_frame_millis_) >= FRAME_SEND_MILLIS_FROM_LAST_SEND;
 }
 
+// LOCAL: see set_tu2c_header_window(). No window while the wall remote is silent.
+bool ToshibaAbClimate::in_tu2c_header_window_(uint32_t now) const {
+  if (!this->tu2c_header_window_enabled_)
+    return false;
+  // Room temperature report, every 30 s.
+  if (this->tu2c_header_temp_ms_ != 0) {
+    const uint32_t since = now - this->tu2c_header_temp_ms_;
+    const uint32_t phase = since % 30000UL;
+    if (since <= 95000UL && (phase >= 28500UL || phase < 1000UL))
+      return true;
+  }
+  // F3 keepalive query, every 60 s (added 2026-10-31: code 32 on 10-30 with the report protected).
+  if (this->tu2c_header_ka_ms_ != 0) {
+    const uint32_t since = now - this->tu2c_header_ka_ms_;
+    const uint32_t phase = since % 60000UL;
+    if (since <= 185000UL && (phase >= 58500UL || phase < 1000UL))
+      return true;
+  }
+  return false;
+}
+
 bool ToshibaAbClimate::is_initial_frame_send_block_active_(uint32_t now) const {
   return (now - this->boot_millis_) < INITIAL_FRAME_SEND_BLOCK_MILLIS;
 }
@@ -495,7 +516,9 @@ void log_raw_data(const std::string& prefix, const uint8_t raw[], size_t size) {
     std::snprintf(buf, sizeof(buf), "%02X", raw[i]);
     res += buf;
   }
-  ESP_LOGV("RX", "%s: %s", prefix.c_str(), res.c_str());
+  // LOCAL (temporary, 2026-10-28): DEBUG instead of VERBOSE to capture every frame around
+  // check code 32 without recompiling the whole firmware at VERBOSE.
+  ESP_LOGD("RX", "%s: %s", prefix.c_str(), res.c_str());
 }
 
 std::string frame_to_hex_string(const DataFrame *frame) {
@@ -768,6 +791,7 @@ void ToshibaAbClimate::send_remote_temp(float temp_c) {
     tu2c.raw[8] = 0x00;
     tu2c.raw[9] = calculate_tu2c_crc(tu2c.raw, 9);
     ESP_LOGD(TAG, "TU2C: sending room temperature %.1f°C (raw=0x%02X)", rounded_temp_c, raw);
+    this->tu2c_last_report_ms_ = millis() | 1;  // LOCAL
     this->send_command(tu2c);
     return;
   }
@@ -791,6 +815,59 @@ void ToshibaAbClimate::send_remote_temp(float temp_c) {
 }
 
 
+
+void ToshibaAbClimate::send_ext_temp_now_() {
+  float t = NAN;
+  if (this->ext_temp_enabled_ && this->ext_temp_sensor_ != nullptr && this->ext_temp_sensor_->has_state())
+    t = this->ext_temp_sensor_->state;
+  if (!(std::isfinite(t) && t > -40.0f && t < 80.0f)) {
+    t = NAN;
+    // LOCAL: as the TU2C header the room temperature must never stop: after 3 min without it
+    // the unit raises check code 30 and stops the zone (tested 2026-10-31).
+    if (this->is_tu2c_header_())
+      t = this->tu2c_header_fallback_temp_();
+  }
+
+  if (std::isfinite(t)) {
+    ESP_LOGV(TAG, "Using external temp: enqueuing temp %.1f°C", t);
+    this->send_remote_temp(t);   // enqueues; loop() controls bus timing
+  } else {
+    ESP_LOGV(TAG, "report_sensor_temp: source has no valid state");
+  }
+}
+
+// LOCAL: this board is the header wired remote (0x50) on a TU2C bus.
+bool ToshibaAbClimate::is_tu2c_header_() const {
+  return this->data_reader.frame_format() == FrameFormat::TU2C && this->tu2c_remote_address_ == 0x50;
+}
+
+// LOCAL: the unit's own return-air sensor (monitor code 02), shifted as the unit does with its
+// body sensor (FC 06 = +2 °C in heat, FC 17 = 0 in cool); the setpoint as a last resort.
+float ToshibaAbClimate::tu2c_header_fallback_temp_() {
+  float t = NAN;
+  for (auto &ps : this->polled_sensors_) {
+    if (ps.id == 0x02 && ps.sensor != nullptr && ps.sensor->has_state())
+      t = ps.sensor->state;
+  }
+  const char *source = "TA";
+  if (std::isfinite(t)) {
+    if (this->mode == climate::CLIMATE_MODE_HEAT)
+      t -= 2.0f;
+  } else {
+    // The setpoint only as a last resort: not in the first 150 s after boot (the room sensor
+    // and TA arrive shortly) nor within 2 min of our last report, still inside the 3 min limit.
+    const uint32_t now = millis();
+    if (now < 150000UL || (this->tu2c_last_report_ms_ != 0 && now - this->tu2c_last_report_ms_ < 120000UL))
+      return NAN;
+    t = this->target_temperature;
+    source = "setpoint";
+  }
+  if (millis() - this->tu2c_fallback_logged_ms_ > 300000UL || this->tu2c_fallback_logged_ms_ == 0) {
+    this->tu2c_fallback_logged_ms_ = millis() | 1;
+    ESP_LOGW(TAG, "TU2C header: room sensor not available, reporting %.1f°C from %s", t, source);
+  }
+  return t;
+}
 
 void ToshibaAbClimate::send_ping() { // Sends a PING command to the master unit, command goes into queue, sent when loop() finds it
   // typical: 40:00:15:07:08:0C:81:00:00:48:00:9F
@@ -1748,18 +1825,12 @@ void ToshibaAbClimate::setup() {
   // on and off at runtime with set_ext_temp_enabled() (e.g. from a template switch).
   if (this->ext_temp_sensor_ && this->ext_temp_interval_ms_ > 0) {
     this->set_interval(this->ext_temp_interval_ms_, [this]() {
-      if (!this->ext_temp_enabled_)
+      // LOCAL: with a sync delay the report follows the wall remote's own report (see
+      // the 61 38 handler); the timer only covers a silent wall remote (45 s).
+      if (this->tu2c_temp_sync_delay_ms_ != 0 && this->tu2c_header_temp_ms_ != 0 &&
+          millis() - this->tu2c_header_temp_ms_ < 45000UL)
         return;
-      float t = NAN;
-      if (this->ext_temp_sensor_->has_state())
-        t = this->ext_temp_sensor_->state;
-
-      if (std::isfinite(t) && t > -40.0f && t < 80.0f) {
-        ESP_LOGV(TAG, "Using external temp: enqueuing temp %.1f°C", t);
-        this->send_remote_temp(t);   // enqueues; loop() controls bus timing
-      } else {
-        ESP_LOGV(TAG, "report_sensor_temp: source has no valid state");
-      }
+      this->send_ext_temp_now_();
     });
   }
   this->set_interval(1000, [this]() {
@@ -2242,6 +2313,7 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
   }
 
   const size_t size = frame->size();
+  this->record_bus_frame_(frame->raw, size, 0);  // LOCAL
   if (size < 4) {
     log_raw_data("TU2C frame too short", frame->raw, size);
     return;
@@ -2274,6 +2346,9 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
   if (frame_length == 0x12 && this->is_tu2c_registration_ack_(frame)) {
     log_raw_data("Master registration ACK frame", frame->raw, size);
     ESP_LOGD(TAG, "Registration ACK from master %02X", source);
+    // LOCAL: as the header report the room temperature right away (3 min limit, see above).
+    if (this->is_tu2c_header_())
+      this->set_timeout("tu2c_first_report", 300, [this]() { this->send_ext_temp_now_(); });
     this->announce_ack_received_ = true;
     return;
   }
@@ -2322,6 +2397,8 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
       // Monitor-function query; the keepalive is the same query for code F3.
       this->tu2c_last_monitor_code_ = frame->raw[payload_offset + 3];
     }
+    if (source != this->tu2c_remote_address_ && this->tu2c_last_monitor_code_ == 0xF3)
+      this->tu2c_header_ka_ms_ = millis() | 1;  // LOCAL: see in_tu2c_header_window_()
     ESP_LOGD(TAG, "Remote %02X keepalive / monitor query code=0x%02X", source, this->tu2c_last_monitor_code_);
     this->record_discovered_address_(source, true);
     return;
@@ -2334,7 +2411,25 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
     const float room_temp =
         static_cast<float>(raw_temp) / TEMPERATURE_CONVERSION_RATIO - TEMPERATURE_CONVERSION_OFFSET;
     tcc_state.room_temp = room_temp;
-    ESP_LOGD(TAG, "Remote %02X room temp: %.1f", source, room_temp);
+    ESP_LOGD(TAG, "Remote %02X room temp: %.1f flag=%02X", source, room_temp, frame->raw[6]);
+    // LOCAL: schedule our report a fixed delay after the wall remote's (not our echo).
+    if (source != this->tu2c_remote_address_) {
+      this->tu2c_header_temp_ms_ = millis() | 1;
+      if (this->tu2c_temp_sync_delay_ms_ != 0) {
+        ESP_LOGD(TAG, "TU2C: room temperature report in %u ms", (unsigned) this->tu2c_temp_sync_delay_ms_);
+        this->set_timeout("tu2c_temp_sync", this->tu2c_temp_sync_delay_ms_, [this]() { this->send_ext_temp_now_(); });
+      }
+    }
+    return;
+  }
+
+  // LOCAL (not in the PR): check code broadcast by the unit, decoded 2026-10-27 from a
+  // Header/Follower fault (30/32 in the wired remote's alarm history):
+  //   LEN 90 FF C0 C0 29 <unit> <code> 59 CRC   code raised (e.g. 0x32 = "32")
+  //   LEN 90 FF C0 A0 29 <unit> 00 59 CRC       cleared
+  if (source == this->tu2c_master_address_ && dest == 0xFF && size >= 9 && frame->raw[5] == 0x29) {
+    log_raw_data("TU2C check code", frame->raw, size);
+    this->handle_tu2c_check_code_(frame->raw[7], frame);
     return;
   }
 
@@ -2345,10 +2440,19 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
 
     if ((!is_status_frame && !is_extended_status_frame) || frame->raw[payload_offset + 1] != 0x38) {
       log_raw_data("TU2C data", frame->raw, size);
+      // LOCAL: settings-menu broadcasts (00 61 / 00 62 / x0 64, FC setting 2026-10-31) are known.
+      const bool menu_broadcast = payload_available >= 2 && (frame->raw[payload_offset] & 0xEF) == 0x00 &&
+                                  (frame->raw[payload_offset + 1] == 0x61 || frame->raw[payload_offset + 1] == 0x62 ||
+                                   frame->raw[payload_offset + 1] == 0x64);
+      if (source == this->tu2c_master_address_ && !menu_broadcast)
+        this->report_tu2c_anomaly_("unknown broadcast from unit", frame, true);  // LOCAL
       return;
     }
     const uint8_t *payload = &frame->raw[payload_offset];
     log_raw_data(is_extended_status_frame ? "TU2C extended status" : "TU2C status", frame->raw, size);
+    this->check_tu2c_status_anomaly_(frame, is_extended_status_frame);  // LOCAL
+    this->publish_tu2c_raw_status_(frame, is_extended_status_frame);    // LOCAL
+    this->refresh_tu2c_alarm_(is_extended_status_frame && size > 15 && frame->raw[14] == 0xFF);  // LOCAL
     tcc_state.power = (payload[STATUS_DATA_MODEPOWER_BYTE] & STATUS_DATA_POWER_MASK);
     tcc_state.mode = decode_status_mode(payload[STATUS_DATA_MODEPOWER_BYTE]);
     tcc_state.fan = (payload[STATUS_DATA_FANVENT_BYTE] & STATUS_DATA_FAN_MASK) >> STATUS_DATA_FAN_SHIFT_BITS;
@@ -2364,8 +2468,14 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
       tcc_state.room_temp =
           static_cast<float>(payload[STATUS_DATA_TARGET_TEMP_BYTE + 1]) / TEMPERATURE_CONVERSION_RATIO -
           TEMPERATURE_CONVERSION_OFFSET;
+      // LOCAL: only the unit's status frame (remote temperature frames also update room_temp).
+      this->tu2c_control_temp_ = tcc_state.room_temp;
+      this->tu2c_control_temp_ms_ = millis() | 1;
     }
     tcc_state.preheating = (payload[STATUS_DATA_FLAGS_BYTE] & 0b00000010) >> 1;
+    if (this->preheat_sensor_ != nullptr &&  // LOCAL
+        !(this->preheat_sensor_->has_state() && this->preheat_sensor_->state == (tcc_state.preheating != 0)))
+      this->preheat_sensor_->publish_state(tcc_state.preheating != 0);
     tcc_state.filter_alert = (payload[STATUS_DATA_FLAGS_BYTE] & 0b10000000) >> 7;
     const uint8_t preset_byte =
         is_extended_status_frame ? TU2C_EXTENDED_STATUS_DATA_PRESET_BYTE : TU2C_STATUS_DATA_PRESET_BYTE;
@@ -2384,6 +2494,13 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
   }
 
   log_raw_data("TU2C data", frame->raw, size);
+  // LOCAL: frames from the unit that are not decoded. Known and not reported (2026-10-31):
+  // replies to a wired remote's queries (80 xx, e.g. 80 0A/0C/0F/10/1A at start-up, 80 A1 command
+  // ACK, 80 A3 "not ready" after an FC change) and the unit's own internal frames (90 -> 90).
+  const bool reply_to_remote = dest != 0xFF && dest != source && payload_available >= 1 &&
+                               frame->raw[payload_offset] == 0x80;
+  if (source == this->tu2c_master_address_ && dest != source && !reply_to_remote)
+    this->report_tu2c_anomaly_("unknown frame from unit", frame, true);
 }
 
 bool ToshibaAbClimate::receive_data(const std::vector<uint8_t> data) {
@@ -2910,6 +3027,8 @@ bool ToshibaAbClimate::receive_data_frame(const struct DataFrame *frame) {
     const size_t size = frame->size();
     if (size < 2 || frame->raw[size - 1] != calculate_tu2c_crc(frame->raw, size - 1)) {
       ESP_LOGW(TAG, "TU2C checksum failed");
+      log_raw_data("TU2C bad checksum", frame->raw, size);  // LOCAL (temporary, 2026-10-28)
+      this->record_bus_frame_(frame->raw, size, 2);  // LOCAL
       this->record_crc_failure_();
       return false;
     }
@@ -3050,7 +3169,8 @@ void ToshibaAbClimate::loop() {
     this->drain_sensor_query_queue_();
   }
 
-  const bool bus_can_send = !initial_send_block_active && this->has_bus_quiet_time_elapsed_(now);
+  const bool bus_can_send = !initial_send_block_active && this->has_bus_quiet_time_elapsed_(now) &&
+                            !this->in_tu2c_header_window_(now);  // LOCAL
 
   if (bus_can_send) {
     optional<DataFrame> frame_to_send{};
@@ -3142,6 +3262,7 @@ void ToshibaAbClimate::loop() {
       auto frame = frame_to_send.value();
       if (frame.is_tu2c()) {
         log_tu2c_data_frame("Write frame", &frame);
+        this->record_bus_frame_(frame.raw, frame.size(), 1);  // LOCAL
       } else {
         log_data_frame("Write frame", &frame);
       }
@@ -4646,6 +4767,205 @@ void ToshibaAbClimate::reset_filter() {
   cmd.raw[6] = calculate_tu2c_crc(cmd.raw, 6);
   ESP_LOGI(TAG, "TU2C: resetting the filter timer");
   this->send_command(cmd);  // dropped in read-only mode
+}
+
+// LOCAL (not in the PR): anomaly trap. Reports frames from the indoor unit that the
+// component does not decode, and status bytes that were constant in every status
+// frame seen so far, so that the first real fault can be captured and decoded.
+// Each anomaly is published once, then again only after 24 h; at most one publication
+// per minute (the rest is only logged). The key is the reason plus the first two payload
+// bytes, or the whole payload (without CRC) for frames that are not decoded at all.
+void ToshibaAbClimate::report_tu2c_anomaly_(const char *reason, const DataFrame *frame, bool full_key) {
+  if (!this->anomaly_trap_) {
+    return;
+  }
+  std::string hex;
+  char buf[4];
+  for (size_t i = 0; i < frame->size(); i++) {
+    snprintf(buf, sizeof(buf), i ? ":%02X" : "%02X", frame->raw[i]);
+    hex += buf;
+  }
+  const std::string msg = std::string(reason) + " | " + hex;
+  std::string key = reason;
+  const size_t key_end = full_key ? (frame->size() > 1 ? frame->size() - 1 : 0) : std::min<size_t>(frame->size(), 6);
+  for (size_t i = 4; i < key_end; i++) {
+    snprintf(buf, sizeof(buf), " %02X", frame->raw[i]);
+    key += buf;
+  }
+  const uint32_t now = millis();
+  auto it = std::find_if(this->anomalies_reported_.begin(), this->anomalies_reported_.end(),
+                         [&key](const ReportedAnomaly &a) { return a.key == key; });
+  if (it != this->anomalies_reported_.end() && now - it->ms < 24UL * 60UL * 60UL * 1000UL) {
+    ESP_LOGV(TAG, "Anomaly (already reported): %s", msg.c_str());
+    return;
+  }
+  if (this->last_anomaly_publish_ms_ != 0 && now - this->last_anomaly_publish_ms_ < 60UL * 1000UL) {
+    ESP_LOGW(TAG, "Anomaly (not published, rate limit): %s", msg.c_str());
+    return;
+  }
+  if (it != this->anomalies_reported_.end()) {
+    it->ms = now;
+  } else {
+    if (this->anomalies_reported_.size() >= 16) {
+      this->anomalies_reported_.erase(this->anomalies_reported_.begin());
+    }
+    this->anomalies_reported_.push_back({key, now});
+  }
+  this->last_anomaly_publish_ms_ = now | 1;
+  ESP_LOGW(TAG, "Anomaly: %s", msg.c_str());
+  if (this->anomaly_text_sensor_ != nullptr) {
+    this->anomaly_text_sensor_->publish_state(msg);
+  }
+}
+
+// LOCAL (not in the PR): check code state. Raised and cleared by the 29 broadcast; the
+// extended status carries FF in byte 14 while a code is active, which keeps it alive.
+// If neither is seen for 5 minutes the alarm is cleared, in case the clear frame was lost.
+void ToshibaAbClimate::handle_tu2c_check_code_(uint8_t code, const DataFrame *frame) {
+  char text[8];
+  if (code == 0) {
+    ESP_LOGW(TAG, "Check code cleared (unit %02X)", frame->raw[6]);
+    this->set_tu2c_alarm_(false, "nessuno");
+    return;
+  }
+  snprintf(text, sizeof(text), "%02X", code);
+  ESP_LOGW(TAG, "Check code %s raised (unit %02X)", text, frame->raw[6]);
+  // LOCAL: first raise of an episode -> publish the bus capture 5 s later (frames after the
+  // raise included), at most once every 10 minutes.
+  if (!this->tu2c_alarm_active_ &&
+      (this->bus_capture_last_dump_ms_ == 0 || millis() - this->bus_capture_last_dump_ms_ > 600000UL)) {
+    const uint32_t ref = millis();
+    this->bus_capture_last_dump_ms_ = ref | 1;
+    this->set_timeout("bus_capture", 5000, [this, ref]() { this->start_bus_capture_dump_(ref); });
+  }
+  this->tu2c_alarm_seen_ms_ = millis() | 1;
+  this->set_tu2c_alarm_(true, text);
+}
+
+// LOCAL: ring buffer of the last BUS_CAPTURE_SIZE TU2C frames (see set_bus_capture_sensor()).
+void ToshibaAbClimate::record_bus_frame_(const uint8_t *raw, size_t len, uint8_t dir) {
+  BusCaptureEntry &e = this->bus_capture_[this->bus_capture_next_];
+  e.ms = millis();
+  e.dir = dir;
+  e.len = static_cast<uint8_t>(std::min<size_t>(len, sizeof(e.raw)));
+  memcpy(e.raw, raw, e.len);
+  this->bus_capture_next_ = (this->bus_capture_next_ + 1) % BUS_CAPTURE_SIZE;
+  if (this->bus_capture_count_ < BUS_CAPTURE_SIZE)
+    this->bus_capture_count_++;
+}
+
+// LOCAL: one line per frame, "<seconds from ref> <RX|TX|BAD> <hex>", every 150 ms.
+void ToshibaAbClimate::start_bus_capture_dump_(uint32_t ref_ms) {
+  if (this->bus_capture_sensor_ == nullptr || this->bus_capture_count_ == 0)
+    return;
+  const uint8_t first = (this->bus_capture_next_ + BUS_CAPTURE_SIZE - this->bus_capture_count_) % BUS_CAPTURE_SIZE;
+  this->bus_capture_dump_.clear();
+  this->bus_capture_dump_.reserve(this->bus_capture_count_);
+  for (uint8_t i = 0; i < this->bus_capture_count_; i++)
+    this->bus_capture_dump_.push_back(this->bus_capture_[(first + i) % BUS_CAPTURE_SIZE]);
+  this->bus_capture_dump_pos_ = 0;
+  this->bus_capture_ref_ms_ = ref_ms;
+  char head[48];
+  snprintf(head, sizeof(head), "inizio cattura: %u messaggi", static_cast<unsigned>(this->bus_capture_dump_.size()));
+  this->bus_capture_sensor_->publish_state(head);
+  this->bus_capture_skip_ = 6;  // ~1 s before the first line, or HA drops "inizio cattura"
+  this->set_interval("bus_capture_step", 150, [this]() {
+    if (this->bus_capture_skip_ > 0) {
+      this->bus_capture_skip_--;
+      return;
+    }
+    if (this->bus_capture_dump_pos_ >= this->bus_capture_dump_.size()) {
+      this->bus_capture_sensor_->publish_state("fine cattura");
+      this->bus_capture_dump_.clear();
+      this->bus_capture_dump_.shrink_to_fit();
+      this->cancel_interval("bus_capture_step");
+      return;
+    }
+    const BusCaptureEntry &e = this->bus_capture_dump_[this->bus_capture_dump_pos_++];
+    const int32_t rel = static_cast<int32_t>(e.ms - this->bus_capture_ref_ms_);
+    const uint32_t mag = rel < 0 ? static_cast<uint32_t>(-rel) : static_cast<uint32_t>(rel);
+    char buf[100];
+    int n = snprintf(buf, sizeof(buf), "%c%u.%03u %s", rel < 0 ? '-' : '+', static_cast<unsigned>(mag / 1000),
+                     static_cast<unsigned>(mag % 1000), e.dir == 1 ? "TX" : (e.dir == 2 ? "BAD" : "RX"));
+    for (uint8_t i = 0; i < e.len && n > 0 && n < static_cast<int>(sizeof(buf)) - 4; i++)
+      n += snprintf(buf + n, sizeof(buf) - n, "%c%02X", i ? ':' : ' ', e.raw[i]);
+    this->bus_capture_sensor_->publish_state(buf);
+  });
+}
+
+void ToshibaAbClimate::refresh_tu2c_alarm_(bool active_flag) {
+  if (!this->tu2c_alarm_active_) {
+    return;
+  }
+  if (active_flag) {
+    this->tu2c_alarm_seen_ms_ = millis() | 1;
+  } else if (millis() - this->tu2c_alarm_seen_ms_ > 5UL * 60UL * 1000UL) {
+    ESP_LOGW(TAG, "Check code not seen for 5 minutes; clearing");
+    this->set_tu2c_alarm_(false, "nessuno");
+  }
+}
+
+void ToshibaAbClimate::set_tu2c_alarm_(bool active, const char *code) {
+  this->tu2c_alarm_active_ = active;
+  if (this->check_code_sensor_ != nullptr &&
+      !(this->check_code_sensor_->has_state() && this->check_code_sensor_->state == code)) {
+    this->check_code_sensor_->publish_state(code);
+  }
+  if (this->alarm_active_sensor_ != nullptr) {
+    this->alarm_active_sensor_->publish_state(active);
+  }
+}
+
+// LOCAL (not in the PR): raw status frame as hex, published only when it changes.
+void ToshibaAbClimate::publish_tu2c_raw_status_(const DataFrame *frame, bool extended) {
+  text_sensor::TextSensor *sensor = extended ? this->raw_extended_status_sensor_ : this->raw_status_sensor_;
+  if (sensor == nullptr) {
+    return;
+  }
+  std::string hex;
+  char buf[4];
+  for (size_t i = 0; i < frame->size(); i++) {
+    snprintf(buf, sizeof(buf), i ? ":%02X" : "%02X", frame->raw[i]);
+    hex += buf;
+  }
+  if (sensor->has_state() && sensor->state == hex) {
+    return;
+  }
+  sensor->publish_state(hex);
+}
+
+void ToshibaAbClimate::check_tu2c_status_anomaly_(const DataFrame *frame, bool extended) {
+  // Constant in every status frame of RAS-M07/M10/M22U2DVG-E seen in 2026-10: the flags
+  // byte without preheat (bit 1) and filter (bit 7), and the bytes not decoded yet.
+  // The 0x33/0x55 pairs follow the mode (0x55 in heat, as in get_heat_cool_bits()).
+  struct Expected {
+    uint8_t index;
+    uint8_t mask;
+    uint8_t value;
+    uint8_t alt;
+  };
+  static const Expected NORMAL[] = {
+      {8, 0x7D, 0x00, 0x00}, {9, 0xFF, 0x00, 0x00}, {13, 0xFF, 0x33, 0x55}, {14, 0xFF, 0x33, 0x55}};
+  static const Expected EXTENDED[] = {{8, 0x7D, 0x00, 0x00},  {9, 0xFF, 0x00, 0x00},  {12, 0xFF, 0x00, 0x00},
+                                      {13, 0xFF, 0x59, 0x59},  {14, 0xFF, 0x00, 0xFF},  {16, 0xFF, 0x33, 0x55},
+                                      {17, 0xFF, 0x33, 0x55}};
+  const Expected *list = extended ? EXTENDED : NORMAL;
+  const size_t count = extended ? sizeof(EXTENDED) / sizeof(EXTENDED[0]) : sizeof(NORMAL) / sizeof(NORMAL[0]);
+  const size_t size = frame->size();
+  for (size_t i = 0; i < count; i++) {
+    const Expected &e = list[i];
+    if (e.index + 1 >= size) {
+      continue;
+    }
+    const uint8_t v = frame->raw[e.index] & e.mask;
+    if (v != e.value && v != e.alt) {
+      char reason[80];
+      snprintf(reason, sizeof(reason), "%s status byte %u = 0x%02X (usual 0x%02X)", extended ? "extended" : "normal",
+               e.index, frame->raw[e.index], e.value);
+      this->report_tu2c_anomaly_(reason, frame);
+      return;
+    }
+  }
 }
 
 void ToshibaAbClimate::set_tu2c_remote_address(uint8_t address) {

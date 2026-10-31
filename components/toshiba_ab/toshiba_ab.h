@@ -1113,6 +1113,53 @@ class ToshibaAbClimate : public Component, public uart::UARTDevice, public clima
   void set_ext_temp_source(sensor::Sensor *s) { ext_temp_sensor_ = s; }
   void set_ext_temp_interval(uint32_t ms) { ext_temp_interval_ms_ = ms; }
   void set_ext_temp_enabled(bool en) { ext_temp_enabled_ = en; }
+  // LOCAL (not in the PR): control temperature the indoor unit is using (room byte of
+  // the TU2C status frame); NAN until a status frame arrives or after 5 minutes without one.
+  // LOCAL (not in the PR): anomaly trap, see report_tu2c_anomaly_().
+  void set_anomaly_trap(bool enabled) {
+    anomaly_trap_ = enabled;
+    if (!enabled) anomalies_reported_.clear();
+  }
+  void set_anomaly_text_sensor(text_sensor::TextSensor *sensor) { anomaly_text_sensor_ = sensor; }
+  // LOCAL (not in the PR): raw TU2C status frames (normal C0 38 / extended A0 38) as hex,
+  // published only when they change, so their history can be matched to unit events.
+  void set_raw_status_text_sensors(text_sensor::TextSensor *normal, text_sensor::TextSensor *extended) {
+    raw_status_sensor_ = normal;
+    raw_extended_status_sensor_ = extended;
+  }
+  // LOCAL (not in the PR): check code broadcast by the unit (see handle_tu2c_check_code_()).
+  void set_check_code_sensors(text_sensor::TextSensor *code, binary_sensor::BinarySensor *active) {
+    check_code_sensor_ = code;
+    alarm_active_sensor_ = active;
+    set_tu2c_alarm_(false, "nessuno");
+  }
+  // LOCAL (not in the PR): send the room temperature a fixed delay after the wall remote's
+  // own 61 38 report instead of on a free-running 30 s timer (0 = free-running timer).
+  // Check code 32 came and went with the two reports on 2026-10-28.
+  void set_tu2c_temp_sync_delay(float seconds) {
+    tu2c_temp_sync_delay_ms_ = seconds > 0 ? static_cast<uint32_t>(seconds * 1000.0f) : 0;
+    if (tu2c_temp_sync_delay_ms_ == 0) cancel_timeout("tu2c_temp_sync");
+  }
+  // LOCAL (not in the PR): hold our frames from 1.5 s before to 1 s after the wall remote's
+  // expected 61 38 report (every 30 s). Check code 32 on 2026-10-29 started when our room
+  // temperature report, and the unit's status reply to it, landed 0.2 s before that report.
+  void set_tu2c_header_window(bool enabled) { tu2c_header_window_enabled_ = enabled; }
+  // LOCAL (not in the PR): the last TU2C frames kept in memory and published one line at a
+  // time to a text sensor when a check code appears, so HA history keeps the capture.
+  void set_bus_capture_sensor(text_sensor::TextSensor *sensor) { bus_capture_sensor_ = sensor; }
+  void dump_bus_capture() { start_bus_capture_dump_(millis()); }
+  // LOCAL (not in the PR): preheat flag of the TU2C status (PRE-HEAT on the wired remote).
+  void set_preheat_sensor(binary_sensor::BinarySensor *sensor) { preheat_sensor_ = sensor; }
+  // LOCAL (not in the PR): register this board with the indoor unit again (49 0D).
+  void request_tu2c_registration() {
+    ESP_LOGI("tcc_link.climate", "TU2C: registering again with the indoor unit");
+    announce_ack_received_ = false;
+    tu2c_remote_announce();
+  }
+  float get_tu2c_control_temp() const {
+    if (tu2c_control_temp_ms_ == 0 || millis() - tu2c_control_temp_ms_ > 5UL * 60UL * 1000UL) return NAN;
+    return tu2c_control_temp_;
+  }
   // 3 (default) or 5: TU2C units with five fan levels also expose the custom fan
   // modes "Low-Medium" (level 2) and "Medium-High" (level 4).
   void set_fan_levels(uint8_t levels) { fan_levels_ = levels; }
@@ -1281,6 +1328,57 @@ class ToshibaAbClimate : public Component, public uart::UARTDevice, public clima
   // TU2C monitor-function queries ("41 5C <unit> <code>"): the reply carries only the
   // value, so it is matched to the last query seen on the bus (ours or the remote's).
   uint8_t tu2c_last_monitor_code_{0xFF};
+  float tu2c_control_temp_{NAN};       // LOCAL
+  bool anomaly_trap_{false};                                  // LOCAL
+  struct ReportedAnomaly {                                    // LOCAL
+    std::string key;
+    uint32_t ms;
+  };
+  std::vector<ReportedAnomaly> anomalies_reported_;           // LOCAL
+  uint32_t last_anomaly_publish_ms_{0};                       // LOCAL
+  text_sensor::TextSensor *anomaly_text_sensor_{nullptr};     // LOCAL
+  void report_tu2c_anomaly_(const char *reason, const DataFrame *frame, bool full_key = false);  // LOCAL
+  text_sensor::TextSensor *check_code_sensor_{nullptr};             // LOCAL
+  binary_sensor::BinarySensor *alarm_active_sensor_{nullptr};       // LOCAL
+  bool tu2c_alarm_active_{false};                                   // LOCAL
+  uint32_t tu2c_alarm_seen_ms_{0};                                  // LOCAL
+  void handle_tu2c_check_code_(uint8_t code, const DataFrame *frame);  // LOCAL
+  void refresh_tu2c_alarm_(bool active_flag);                       // LOCAL
+  void set_tu2c_alarm_(bool active, const char *code);              // LOCAL
+  void check_tu2c_status_anomaly_(const DataFrame *frame, bool extended);  // LOCAL
+  text_sensor::TextSensor *raw_status_sensor_{nullptr};                    // LOCAL
+  text_sensor::TextSensor *raw_extended_status_sensor_{nullptr};           // LOCAL
+  void publish_tu2c_raw_status_(const DataFrame *frame, bool extended);    // LOCAL
+  uint32_t tu2c_control_temp_ms_{0};    // LOCAL
+  uint32_t tu2c_temp_sync_delay_ms_{0};      // LOCAL
+  uint32_t tu2c_header_temp_ms_{0};          // LOCAL: millis() of the wall remote's last 61 38
+  bool tu2c_header_window_enabled_{true};    // LOCAL
+  uint32_t tu2c_header_ka_ms_{0};            // LOCAL: millis() of the wall remote's last F3 keepalive
+  struct BusCaptureEntry {                   // LOCAL
+    uint32_t ms;
+    uint8_t dir;                             // 0 RX, 1 TX, 2 RX with bad checksum
+    uint8_t len;
+    uint8_t raw[24];
+  };
+  static constexpr uint8_t BUS_CAPTURE_SIZE = 64;                // LOCAL
+  std::array<BusCaptureEntry, BUS_CAPTURE_SIZE> bus_capture_{};  // LOCAL
+  uint8_t bus_capture_next_{0};              // LOCAL
+  uint8_t bus_capture_count_{0};             // LOCAL
+  std::vector<BusCaptureEntry> bus_capture_dump_;  // LOCAL
+  size_t bus_capture_dump_pos_{0};           // LOCAL
+  uint32_t bus_capture_ref_ms_{0};           // LOCAL
+  uint32_t bus_capture_last_dump_ms_{0};     // LOCAL
+  text_sensor::TextSensor *bus_capture_sensor_{nullptr};  // LOCAL
+  void record_bus_frame_(const uint8_t *raw, size_t len, uint8_t dir);  // LOCAL
+  void start_bus_capture_dump_(uint32_t ref_ms);  // LOCAL
+  uint8_t bus_capture_skip_{0};              // LOCAL
+  binary_sensor::BinarySensor *preheat_sensor_{nullptr};  // LOCAL
+  bool is_tu2c_header_() const;              // LOCAL
+  float tu2c_header_fallback_temp_();        // LOCAL
+  uint32_t tu2c_fallback_logged_ms_{0};      // LOCAL
+  uint32_t tu2c_last_report_ms_{0};          // LOCAL: millis() of our last 61 38 room temperature
+  bool in_tu2c_header_window_(uint32_t now) const;  // LOCAL
+  void send_ext_temp_now_();                 // LOCAL
   void send_tu2c_monitor_query_(uint8_t code);
   void publish_tu2c_monitor_value_(uint8_t code, int16_t raw);
   uint32_t sensor_query_timeout_ms_{2500};  // Give busy HM buses time to answer before releasing the guard.
