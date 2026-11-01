@@ -1028,7 +1028,9 @@ void ToshibaAbClimate::send_tu2c_monitor_query_(uint8_t code) {
   this->last_sensor_query_id_ = code;
   this->sensor_query_outstanding_ = true;
   this->last_sensor_query_ms_ = millis();
-  this->tu2c_last_monitor_code_ = code;  // in case our own echo is not seen
+  // LOCAL (2026-11-01): tu2c_last_monitor_code_ is set when the query is actually written (or
+  // its echo seen), not here: a query can wait in the queue while the reply to an earlier F3
+  // keepalive arrives, which then landed on TD/TC/fan as 0.
   ESP_LOGV(TAG, "TU2C monitor query code=0x%02X", code);
   this->send_command(cmd);
 }
@@ -2383,6 +2385,9 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
       frame->raw[payload_offset] == 0x80) {
     log_raw_data("Master ACK frame", frame->raw, size);
     if (frame->raw[payload_offset + 1] == 0x5C) {
+      // LOCAL (2026-11-01): a reply to the wall remote's own query is not ours.
+      if (dest != this->tu2c_remote_address_)
+        return;
       // Monitor-function reply: signed 16-bit value of the last "41 5C" query on the
       // bus (ours or the wired remote's), as the reply does not repeat the code.
       const int16_t raw = static_cast<int16_t>((static_cast<uint16_t>(frame->raw[payload_offset + 2]) << 8) |
@@ -2406,6 +2411,8 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
   if (frame_length == 0x0A && source == this->tu2c_master_address_ && payload_available >= 2 &&
       frame->raw[payload_offset] == 0x80 && frame->raw[payload_offset + 1] == 0xA2) {
     // Monitor-function "no data" reply (shown as ---- on the wired remote).
+    if (dest != this->tu2c_remote_address_)  // LOCAL (2026-11-01): reply to the wall remote
+      return;
     const uint8_t code = this->tu2c_last_monitor_code_;
     ESP_LOGD(TAG, "TU2C monitor code=0x%02X: not available on this unit", code);
     if (this->sensor_query_outstanding_ && this->last_sensor_query_id_ == code) {
@@ -2419,13 +2426,14 @@ void ToshibaAbClimate::process_received_data_tu2c_(const struct DataFrame *frame
   if (frame_length == 0x0C && payload_available >= 2 && frame->raw[payload_offset] == 0x41 &&
       frame->raw[payload_offset + 1] == 0x5C) {
     log_raw_data("Remote keepalive frame", frame->raw, size);
-    if (payload_available >= 4) {
-      // Monitor-function query; the keepalive is the same query for code F3.
-      this->tu2c_last_monitor_code_ = frame->raw[payload_offset + 3];
-    }
-    if (source != this->tu2c_remote_address_ && this->tu2c_last_monitor_code_ == 0xF3)
+    const uint8_t query_code = payload_available >= 4 ? frame->raw[payload_offset + 3] : 0xFF;
+    // Monitor-function query; the keepalive is the same query for code F3. LOCAL: only our own
+    // queries (echo) set the code the next 80 5C reply belongs to (2026-11-01).
+    if (source == this->tu2c_remote_address_ && query_code != 0xFF)
+      this->tu2c_last_monitor_code_ = query_code;
+    if (source != this->tu2c_remote_address_ && query_code == 0xF3)
       this->tu2c_header_ka_ms_ = millis() | 1;  // LOCAL: see in_tu2c_header_window_()
-    ESP_LOGD(TAG, "Remote %02X keepalive / monitor query code=0x%02X", source, this->tu2c_last_monitor_code_);
+    ESP_LOGD(TAG, "Remote %02X keepalive / monitor query code=0x%02X", source, query_code);
     this->record_discovered_address_(source, true);
     return;
   }
@@ -3296,6 +3304,9 @@ void ToshibaAbClimate::loop() {
         this->record_bus_frame_(frame.raw, frame.size(), 1);  // LOCAL
         if (frame.raw[1] == this->tu2c_remote_address_ && frame.raw[4] == 0x61 && frame.raw[5] == 0x38)
           this->tu2c_report_sent_ms_ = millis() | 1;  // LOCAL: see check_tu2c_report_answered_()
+        if (frame.raw[1] == this->tu2c_remote_address_ && frame.raw[4] == 0x41 && frame.raw[5] == 0x5C &&
+            frame.size() > 8)
+          this->tu2c_last_monitor_code_ = frame.raw[7];  // LOCAL: our monitor query is on the bus now
       } else {
         log_data_frame("Write frame", &frame);
       }

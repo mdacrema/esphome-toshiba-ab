@@ -45,6 +45,10 @@ wifi:
     ssid: "${name} Fallback"
     password: !secret fallback_hotspot_password
 
+# 2026-11-01: reset reason in HA history (watchdog, crash, OTA, power loss)
+debug:
+  update_interval: 60min
+
 captive_portal:
 
 external_components:
@@ -408,6 +412,11 @@ sensor:
     name: "Uptime"
 
 text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Motivo ultimo riavvio"
+      icon: mdi:restart-alert
+      entity_category: diagnostic
   # LOCAL (2026-10-31): last 64 TU2C frames, published one line every 150 ms when a check code
   # appears ("<s from the code> RX|TX|BAD <hex>"); HA history keeps every line.
   - platform: template
