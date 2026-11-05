@@ -23,6 +23,15 @@ esphome:
       - lambda: id(clima)->set_preheat_sensor(id(clima_preriscaldamento));
       # LOCAL: room temperature report a fixed delay after the wall remote's (0 = 30 s timer)
       - lambda: id(clima)->set_tu2c_temp_sync_delay(id(ritardo_invio_temperatura).state);
+      # LOCAL (2026-11-05): room temperature kept from before the reboot (NAN after a power loss)
+      - lambda: |-
+          char buf[48];
+          if (std::isnan(id(zigbee_last_valid)))
+            snprintf(buf, sizeof(buf), "nessuna");
+          else
+            snprintf(buf, sizeof(buf), "%.1f °C, tenuta da %u s", id(zigbee_last_valid), (unsigned) id(zigbee_stale_s));
+          ESP_LOGI("zigbee_temp", "After reboot: last room temperature %s", buf);
+          id(temp_ripresa_riavvio).publish_state(buf);
 
 esp8266:
   board: esp12e
@@ -194,9 +203,21 @@ climate:
           entity_category: diagnostic
 
 globals:
+  # LOCAL (2026-11-05): the last value and its hold time survive software reboots (RTC memory,
+  # lost on power loss). With Home Assistant down the board reboots every 5 min (api
+  # reboot_timeout) and lost the value: on 11-04 the unit then regulated on TA - 2 = setpoint
+  # and heated during the 17 min outage.
   - id: zigbee_last_valid
     type: float
+    restore_value: true
     initial_value: "NAN"
+  - id: zigbee_stale_s             # seconds the last value has been held without a fresh one (HA down or sensor unavailable)
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: zigbee_fresh               # a valid value has arrived from HA since boot
+    type: bool
+    initial_value: "false"
   - id: zigbee_unavailable_since   # millis() when the HA entity became unavailable, 0 = available
     type: uint32_t
     initial_value: "0"
@@ -222,9 +243,7 @@ binary_sensor:
   - platform: template
     name: "Clima su sonda interna (sensore scaduto)"
     device_class: problem
-    lambda: |-
-      return id(zigbee_unavailable_since) != 0 &&
-             millis() - id(zigbee_unavailable_since) >= 30UL * 60UL * 1000UL;
+    lambda: return id(zigbee_stale_s) >= 30UL * 60UL;
 
 interval:
   - interval: 10s
@@ -239,8 +258,18 @@ interval:
             - lambda: |-
                 if (id(ha_disconnected_since) == 0) {
                   id(ha_disconnected_since) = millis() | 1;
-                  ESP_LOGW("zigbee_temp", "Home Assistant disconnected: holding the last room temperature for 30 min");
+                  ESP_LOGW("zigbee_temp", "Home Assistant disconnected: holding %.1f°C (%u s of 30 min already used)",
+                           id(zigbee_last_valid), (unsigned) id(zigbee_stale_s));
                 }
+      # Hold time of the last room temperature, also across reboots: 0 while HA is connected and
+      # the sensor is available, otherwise +10 s per tick up to 30 min.
+      - lambda: |-
+          if (id(ha_disconnected_since) == 0 && id(zigbee_fresh) && id(zigbee_unavailable_since) == 0) {
+            if (id(zigbee_stale_s) != 0)
+              id(zigbee_stale_s) = 0;
+          } else if (id(zigbee_stale_s) < 30UL * 60UL) {
+            id(zigbee_stale_s) += 10;
+          }
 
 number:
   # LOCAL (2026-10-28/29, check code 32): seconds between the wall remote's room temperature
@@ -342,9 +371,9 @@ switch:
 
 sensor:
   # Zigbee room sensor from Home Assistant. An unchanged value is not re-sent by HA: the
-  # last value is kept and re-sent to the unit every 30 s. Only "unavailable" (NAN) counts
-  # as a failure: the last good value is held for 30 minutes, then reporting stops and the
-  # unit falls back to its own return-air sensor.
+  # last value is kept and re-sent to the unit every 30 s. Only "unavailable" (NAN) or HA
+  # down counts as a failure: the last good value is held for 30 minutes (also across
+  # reboots), then the board reports the unit's return-air sensor (header fallback, TA - 2).
   - platform: homeassistant
     id: temp_studio_ha
     entity_id: sensor.clima_zona_studi_temperatura_riferimento   # reference sensor chosen in HA (input_select)
@@ -360,6 +389,7 @@ sensor:
             if (id(zigbee_unavailable_since) != 0)
               ESP_LOGI("zigbee_temp", "Room sensor available again: %.1f°C", x);
             id(zigbee_last_valid) = x;
+            id(zigbee_fresh) = true;
             id(zigbee_unavailable_since) = 0;
             id(temp_studio_zigbee).update();  // publish now (first value after boot: header report)
           }
@@ -394,16 +424,11 @@ sensor:
     # Published already rounded to 0.5 °C, the resolution of the TU2C frame
     # (raw = (°C + 35) * 2, rounded to nearest): this is exactly what the unit receives.
     lambda: |-
-      // Home Assistant down for 30 minutes: the last value may be stale, stop reporting.
-      if (id(ha_disconnected_since) != 0 &&
-          millis() - id(ha_disconnected_since) >= 30UL * 60UL * 1000UL)
-        return NAN;
-      float t = NAN;
-      if (id(zigbee_unavailable_since) == 0)
-        t = id(zigbee_last_valid);
-      else if (millis() - id(zigbee_unavailable_since) < 30UL * 60UL * 1000UL)
-        t = id(zigbee_last_valid);      // hold the last good value for 30 minutes
-      // else NAN: stop reporting, the unit uses its own sensor
+      // The last good value, held up to 30 min without a fresh one (HA down or sensor
+      // unavailable, counted across reboots); then NAN and the header falls back to TA.
+      float t = id(zigbee_last_valid);
+      if (id(zigbee_stale_s) >= 30UL * 60UL)
+        t = NAN;
       return std::isnan(t) ? NAN : std::round(t * 2.0f) / 2.0f;
   - platform: wifi_signal
     name: "Segnale WiFi"
@@ -412,6 +437,13 @@ sensor:
     name: "Uptime"
 
 text_sensor:
+  # LOCAL (2026-11-05): room temperature the board kept across its last reboot (see globals)
+  - platform: template
+    id: temp_ripresa_riavvio
+    name: "Temperatura ripresa dopo il riavvio"
+    icon: mdi:thermometer-check
+    entity_category: diagnostic
+    update_interval: never
   - platform: debug
     reset_reason:
       name: "Motivo ultimo riavvio"
